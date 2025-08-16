@@ -13,11 +13,67 @@
 (define-constant ERR_SUBSCRIPTION_EXECUTION_FAILED (err u111))
 (define-constant ERR_INVALID_INTERVAL (err u112))
 (define-constant ERR_INSUFFICIENT_SUBSCRIPTION_BALANCE (err u113))
+(define-constant ERR_CERTIFICATION_NOT_FOUND (err u114))
+(define-constant ERR_CERTIFICATION_ALREADY_EXISTS (err u115))
+(define-constant ERR_INVALID_CERTIFICATION_TYPE (err u116))
+(define-constant ERR_CERTIFICATION_EXPIRED (err u117))
+(define-constant ERR_NOT_CERTIFIED_AUTHORITY (err u118))
+(define-constant ERR_CERTIFICATION_INACTIVE (err u119))
 
 (define-fungible-token watt-token)
 
 (define-data-var total-energy-tokenized uint u0)
 (define-data-var platform-fee-rate uint u250)
+(define-data-var next-certification-id uint u1)
+
+;; Energy source types with quality multipliers
+(define-map energy-source-types
+  { source-type: uint }
+  {
+    name: (string-ascii 20),
+    carbon-footprint: uint, ;; grams CO2 per kWh
+    quality-multiplier: uint, ;; percentage bonus (100 = no bonus, 150 = 50% bonus)
+    is-renewable: bool
+  }
+)
+
+;; Certification authorities
+(define-map certification-authorities
+  { authority: principal }
+  {
+    name: (string-ascii 50),
+    is-active: bool,
+    certifications-issued: uint,
+    registered-at: uint
+  }
+)
+
+;; Device certifications
+(define-map device-certifications
+  { device-id: (string-ascii 50) }
+  {
+    certification-id: uint,
+    energy-source-type: uint,
+    certified-by: principal,
+    certified-at: uint,
+    expires-at: uint,
+    is-active: bool,
+    verification-hash: (string-ascii 64)
+  }
+)
+
+;; Certification details
+(define-map certifications
+  { certification-id: uint }
+  {
+    device-id: (string-ascii 50),
+    energy-source-type: uint,
+    certified-capacity: uint,
+    certification-fee-paid: uint,
+    quality-verified: bool,
+    carbon-offset-tokens: uint
+  }
+)
 
 (define-map devices
   { device-id: (string-ascii 50) }
@@ -433,6 +489,219 @@
   )
 )
 
+;; Initialize predefined energy source types
+(define-private (initialize-energy-types)
+  (begin
+    (map-set energy-source-types { source-type: u1 } { name: "Solar", carbon-footprint: u40, quality-multiplier: u125, is-renewable: true })
+    (map-set energy-source-types { source-type: u2 } { name: "Wind", carbon-footprint: u30, quality-multiplier: u130, is-renewable: true })
+    (map-set energy-source-types { source-type: u3 } { name: "Hydro", carbon-footprint: u24, quality-multiplier: u135, is-renewable: true })
+    (map-set energy-source-types { source-type: u4 } { name: "Geothermal", carbon-footprint: u38, quality-multiplier: u120, is-renewable: true })
+    (map-set energy-source-types { source-type: u5 } { name: "Nuclear", carbon-footprint: u12, quality-multiplier: u140, is-renewable: false })
+    (map-set energy-source-types { source-type: u6 } { name: "Natural Gas", carbon-footprint: u490, quality-multiplier: u100, is-renewable: false })
+    (map-set energy-source-types { source-type: u7 } { name: "Coal", carbon-footprint: u820, quality-multiplier: u90, is-renewable: false })
+    (ok true)
+  )
+)
+
+;; Register as certification authority
+(define-public (register-certification-authority (name (string-ascii 50)))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (asserts! (is-none (map-get? certification-authorities { authority: tx-sender })) ERR_CERTIFICATION_ALREADY_EXISTS)
+    (map-set certification-authorities
+      { authority: tx-sender }
+      {
+        name: name,
+        is-active: true,
+        certifications-issued: u0,
+        registered-at: stacks-block-height
+      }
+    )
+    (ok tx-sender)
+  )
+)
+
+;; Certify device energy source
+(define-public (certify-device-energy-source (device-id (string-ascii 50)) (energy-source-type uint) (verification-hash (string-ascii 64)) (certification-fee uint) (valid-blocks uint))
+  (let ((device-data (unwrap! (map-get? devices { device-id: device-id }) ERR_DEVICE_NOT_FOUND))
+        (authority-data (unwrap! (map-get? certification-authorities { authority: tx-sender }) ERR_NOT_CERTIFIED_AUTHORITY))
+        (source-type-data (unwrap! (map-get? energy-source-types { source-type: energy-source-type }) ERR_INVALID_CERTIFICATION_TYPE))
+        (certification-id (var-get next-certification-id))
+        (existing-cert (map-get? device-certifications { device-id: device-id })))
+    (asserts! (get is-active authority-data) ERR_NOT_CERTIFIED_AUTHORITY)
+    (asserts! (is-none existing-cert) ERR_CERTIFICATION_ALREADY_EXISTS)
+    (asserts! (> valid-blocks u0) ERR_INVALID_AMOUNT)
+    (asserts! (> certification-fee u0) ERR_INVALID_AMOUNT)
+    ;; Collect certification fee from device owner
+    (try! (stx-transfer? certification-fee (get owner device-data) tx-sender))
+    ;; Create certification record
+    (map-set device-certifications
+      { device-id: device-id }
+      {
+        certification-id: certification-id,
+        energy-source-type: energy-source-type,
+        certified-by: tx-sender,
+        certified-at: stacks-block-height,
+        expires-at: (+ stacks-block-height valid-blocks),
+        is-active: true,
+        verification-hash: verification-hash
+      }
+    )
+    ;; Store certification details
+    (map-set certifications
+      { certification-id: certification-id }
+      {
+        device-id: device-id,
+        energy-source-type: energy-source-type,
+        certified-capacity: (get energy-capacity device-data),
+        certification-fee-paid: certification-fee,
+        quality-verified: true,
+        carbon-offset-tokens: (* (get energy-capacity device-data) (- u1000 (get carbon-footprint source-type-data)))
+      }
+    )
+    ;; Update authority stats
+    (map-set certification-authorities
+      { authority: tx-sender }
+      (merge authority-data { certifications-issued: (+ (get certifications-issued authority-data) u1) })
+    )
+    (var-set next-certification-id (+ certification-id u1))
+    (ok certification-id)
+  )
+)
+
+;; Purchase certified energy with quality premium
+(define-public (purchase-certified-energy (device-id (string-ascii 50)) (energy-amount uint))
+  (let ((device-data (unwrap! (map-get? devices { device-id: device-id }) ERR_DEVICE_NOT_FOUND))
+        (cert-data (unwrap! (map-get? device-certifications { device-id: device-id }) ERR_CERTIFICATION_NOT_FOUND))
+        (source-data (unwrap! (map-get? energy-source-types { source-type: (get energy-source-type cert-data) }) ERR_INVALID_CERTIFICATION_TYPE)))
+    (asserts! (not (is-eq tx-sender (get owner device-data))) ERR_SELF_PURCHASE)
+    (asserts! (> energy-amount u0) ERR_INVALID_AMOUNT)
+    (asserts! (get is-active cert-data) ERR_CERTIFICATION_INACTIVE)
+    (asserts! (< stacks-block-height (get expires-at cert-data)) ERR_CERTIFICATION_EXPIRED)
+    (asserts! (>= (get energy-available device-data) energy-amount) ERR_INSUFFICIENT_TOKENS)
+    (asserts! (get is-active device-data) ERR_DEVICE_NOT_FOUND)
+    ;; Calculate premium price with quality multiplier
+    (let ((base-cost (* energy-amount (get price-per-watt device-data)))
+          (premium-cost (/ (* base-cost (get quality-multiplier source-data)) u100))
+          (platform-fee (/ (* premium-cost (var-get platform-fee-rate)) u10000))
+          (seller-payment (- premium-cost platform-fee)))
+      (try! (stx-transfer? premium-cost tx-sender (get owner device-data)))
+      (try! (ft-transfer? watt-token energy-amount (get owner device-data) tx-sender))
+      ;; Update device energy availability
+      (map-set devices
+        { device-id: device-id }
+        (merge device-data {
+          energy-available: (- (get energy-available device-data) energy-amount)
+        })
+      )
+      (record-transaction (get owner device-data) tx-sender device-id energy-amount premium-cost)
+      (update-user-profile (get owner device-data) energy-amount u0 u0 u15) ;; Bonus reputation for certified energy
+      (update-user-profile tx-sender u0 energy-amount u0 u8) ;; Bonus reputation for purchasing clean energy
+      (ok energy-amount)
+    )
+  )
+)
+
+;; Renew device certification
+(define-public (renew-device-certification (device-id (string-ascii 50)) (new-verification-hash (string-ascii 64)) (renewal-fee uint) (valid-blocks uint))
+  (let ((cert-data (unwrap! (map-get? device-certifications { device-id: device-id }) ERR_CERTIFICATION_NOT_FOUND))
+        (authority-data (unwrap! (map-get? certification-authorities { authority: tx-sender }) ERR_NOT_CERTIFIED_AUTHORITY))
+        (device-data (unwrap! (map-get? devices { device-id: device-id }) ERR_DEVICE_NOT_FOUND)))
+    (asserts! (get is-active authority-data) ERR_NOT_CERTIFIED_AUTHORITY)
+    (asserts! (is-eq (get certified-by cert-data) tx-sender) ERR_UNAUTHORIZED)
+    (asserts! (> renewal-fee u0) ERR_INVALID_AMOUNT)
+    (asserts! (> valid-blocks u0) ERR_INVALID_AMOUNT)
+    ;; Collect renewal fee
+    (try! (stx-transfer? renewal-fee (get owner device-data) tx-sender))
+    ;; Update certification
+    (map-set device-certifications
+      { device-id: device-id }
+      (merge cert-data {
+        certified-at: stacks-block-height,
+        expires-at: (+ stacks-block-height valid-blocks),
+        verification-hash: new-verification-hash
+      })
+    )
+    (ok true)
+  )
+)
+
+;; Revoke device certification
+(define-public (revoke-device-certification (device-id (string-ascii 50)))
+  (let ((cert-data (unwrap! (map-get? device-certifications { device-id: device-id }) ERR_CERTIFICATION_NOT_FOUND)))
+    (asserts! (or (is-eq tx-sender CONTRACT_OWNER) (is-eq tx-sender (get certified-by cert-data))) ERR_UNAUTHORIZED)
+    (map-set device-certifications
+      { device-id: device-id }
+      (merge cert-data { is-active: false })
+    )
+    (ok true)
+  )
+)
+
+;; Calculate certified energy price with premium
+(define-read-only (calculate-certified-energy-price (device-id (string-ascii 50)) (energy-amount uint))
+  (match (map-get? devices { device-id: device-id })
+    device-data
+    (match (map-get? device-certifications { device-id: device-id })
+      cert-data
+      (match (map-get? energy-source-types { source-type: (get energy-source-type cert-data) })
+        source-data
+        (let ((base-cost (* energy-amount (get price-per-watt device-data)))
+              (premium-cost (/ (* base-cost (get quality-multiplier source-data)) u100))
+              (platform-fee (/ (* premium-cost (var-get platform-fee-rate)) u10000)))
+          (ok {
+            base-cost: base-cost,
+            premium-cost: premium-cost,
+            quality-multiplier: (get quality-multiplier source-data),
+            platform-fee: platform-fee,
+            seller-receives: (- premium-cost platform-fee),
+            carbon-footprint-per-kwh: (get carbon-footprint source-data)
+          })
+        )
+        ERR_INVALID_CERTIFICATION_TYPE
+      )
+      ERR_CERTIFICATION_NOT_FOUND
+    )
+    ERR_DEVICE_NOT_FOUND
+  )
+)
+
+;; Read-only functions for certification data
+(define-read-only (get-device-certification (device-id (string-ascii 50)))
+  (map-get? device-certifications { device-id: device-id })
+)
+
+(define-read-only (get-energy-source-type (source-type uint))
+  (map-get? energy-source-types { source-type: source-type })
+)
+
+(define-read-only (get-certification-authority (authority principal))
+  (map-get? certification-authorities { authority: authority })
+)
+
+(define-read-only (get-certification-details (certification-id uint))
+  (map-get? certifications { certification-id: certification-id })
+)
+
+(define-read-only (is-certification-valid (device-id (string-ascii 50)))
+  (match (map-get? device-certifications { device-id: device-id })
+    cert-data
+    (and
+      (get is-active cert-data)
+      (< stacks-block-height (get expires-at cert-data))
+    )
+    false
+  )
+)
+
+(define-read-only (get-certified-devices-stats)
+  {
+    total-certifications: (- (var-get next-certification-id) u1),
+    renewable-sources: u5, ;; Solar, Wind, Hydro, Geothermal, Nuclear
+    non-renewable-sources: u2 ;; Natural Gas, Coal
+  }
+)
+
 (define-private (update-user-profile (user principal) (energy-sold uint) (energy-bought uint) (devices-added uint) (reputation-points uint))
   (let ((current-profile (default-to
     { total-energy-sold: u0, total-energy-bought: u0, devices-count: u0, reputation-score: u0 }
@@ -448,3 +717,6 @@
     )
   )
 )
+
+
+
